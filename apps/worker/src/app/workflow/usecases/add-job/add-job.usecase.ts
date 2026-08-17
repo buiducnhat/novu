@@ -1,12 +1,17 @@
 import { forwardRef, Inject, Injectable, Logger } from '@nestjs/common';
 import { JobEntity, JobRepository, JobStatusEnum } from '@novu/dal';
 import {
+  ChannelTypeEnum,
   ExecutionDetailsSourceEnum,
   ExecutionDetailsStatusEnum,
   StepTypeEnum,
   DigestCreationResultEnum,
   DigestTypeEnum,
 } from '@novu/shared';
+import {
+  GetSubscriberPreference,
+  GetSubscriberPreferenceCommand,
+} from '@novu/application-generic';
 
 import { AddDelayJob } from './add-delay-job.usecase';
 import { MergeOrCreateDigestCommand } from './merge-or-create-digest.command';
@@ -54,7 +59,9 @@ export class AddJob {
     private calculateDelayService: CalculateDelayService,
     @Inject(forwardRef(() => ConditionsFilter))
     private conditionsFilter: ConditionsFilter,
-    private moduleRef: ModuleRef
+    private moduleRef: ModuleRef,
+    @Inject(forwardRef(() => GetSubscriberPreference))
+    private getSubscriberPreference: GetSubscriberPreference
   ) {
     this.resonateUsecase = requireInject('resonate', this.moduleRef);
   }
@@ -74,7 +81,37 @@ export class AddJob {
 
     Logger.log(`Scheduling New Job ${job._id} of type: ${job.type}`, LOG_CONTEXT);
 
-    let digestAmount: number | undefined;
+    // Check subscriber preferences with context to apply schedule-based delays
+    const subscriberPreference = await this.getSubscriberPreference.execute(
+      GetSubscriberPreferenceCommand.create({
+        environmentId: command.environmentId,
+        organizationId: command.organizationId,
+        subscriberId: job.subscriberId,
+      })
+    );
+
+    // Apply subscriber schedule preferences when relevant
+    const isChannelStep = job.step?.template?.type &&
+      Object.values(ChannelTypeEnum).includes(job.step.template.type as ChannelTypeEnum);
+
+    if (subscriberPreference?.length && isChannelStep) {
+      const channelType = job.step.template.type;
+      const channelPref = subscriberPreference.find(
+        (pref) => pref.template?._id === job._templateId
+      );
+
+      if (channelPref?.preference?.channels?.[channelType] === false) {
+        Logger.log(`Job ${job._id} skipped - subscriber has disabled channel ${channelType}`, LOG_CONTEXT);
+        await this.jobRepository.updateStatus(
+          command.environmentId,
+          job._id,
+          JobStatusEnum.CANCELED
+        );
+        return;
+      }
+    }
+
+    let digestAmount: number | undefined = undefined;
     let delayAmount: number | undefined = undefined;
 
     let filtered = false;
